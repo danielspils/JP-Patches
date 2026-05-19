@@ -13,6 +13,14 @@ from typing import Any
 import jsonschema
 
 from jx3p.patch import JX3PPatch
+from jx3p.sequence import (
+    JX3PSequence,
+    JX3PStep,
+    JX3PVoice,
+    PAGES_PER_SEQUENCE,
+    STEPS_PER_PAGE,
+    VOICES_PER_STEP,
+)
 
 
 FORMAT_VERSION = "1.0"
@@ -104,6 +112,77 @@ def write_json(path: str | Path, banks: list[list[JX3PPatch]], *, indent: int = 
 def validate_bank_json(data: dict[str, Any]) -> None:
     """Validate a parsed JSON dict against bank.schema.json. Raises ValidationError."""
     _bank_validator().validate(data)
+
+
+# --- sequence JSON ---------------------------------------------------------
+
+def read_seq_json(path: str | Path) -> JX3PSequence:
+    """Read a JX-3P sequence dump from a JSON file."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if data.get("kind") != "sequence":
+        raise ValueError("not a sequence JSON file (missing 'kind': 'sequence')")
+    raw_pages = data.get("pages") or []
+    if len(raw_pages) != PAGES_PER_SEQUENCE:
+        raise ValueError(
+            f"expected {PAGES_PER_SEQUENCE} pages, got {len(raw_pages)}"
+        )
+    seq = JX3PSequence()
+    for i, raw_page in enumerate(raw_pages):
+        seq.pages[i] = _page_from_dict(raw_page, i)
+    return seq
+
+
+def write_seq_json(path: str | Path, seq: JX3PSequence, *, indent: int = 2) -> None:
+    """Write a JX-3P sequence dump to a JSON file."""
+    if len(seq.pages) != PAGES_PER_SEQUENCE:
+        raise ValueError(f"sequence must have {PAGES_PER_SEQUENCE} pages")
+    data = {
+        "format_version": FORMAT_VERSION,
+        "kind": "sequence",
+        "pages": [_page_to_dict(p) for p in seq.pages],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=indent)
+        fh.write("\n")
+
+
+def _page_to_dict(page: list[JX3PStep] | None) -> list[dict] | None:
+    if page is None:
+        return None
+    return [_step_to_dict(s) for s in page]
+
+
+def _page_from_dict(raw_page: list[dict] | None, page_idx: int) -> list[JX3PStep] | None:
+    if raw_page is None:
+        return None
+    if len(raw_page) != STEPS_PER_PAGE:
+        raise ValueError(
+            f"page {page_idx}: expected {STEPS_PER_PAGE} steps, got {len(raw_page)}"
+        )
+    return [_step_from_dict(s) for s in raw_page]
+
+
+def _step_to_dict(step: JX3PStep) -> dict[str, Any]:
+    return {
+        "voices": [None if v is None else {"note": v.note, "tied": v.tied}
+                   for v in step.voices],
+        "byte7": step.byte7,
+    }
+
+
+def _step_from_dict(raw: dict[str, Any]) -> JX3PStep:
+    voices_raw = raw.get("voices") or []
+    if len(voices_raw) != VOICES_PER_STEP:
+        raise ValueError(
+            f"step has {len(voices_raw)} voices, expected {VOICES_PER_STEP}"
+        )
+    voices = [
+        None if v is None else JX3PVoice(note=int(v["note"]), tied=bool(v["tied"]))
+        for v in voices_raw
+    ]
+    byte7 = int(raw.get("byte7", 0x01))
+    return JX3PStep(voices=voices, byte7=byte7)
 
 
 # --- CSV -------------------------------------------------------------------

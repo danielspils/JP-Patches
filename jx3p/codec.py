@@ -20,6 +20,15 @@ from pathlib import Path
 import numpy as np
 
 from jx3p.patch import JX3PPatch
+from jx3p.sequence import (
+    JX3PSequence,
+    PAGES_PER_SEQUENCE,
+    SEQUENCE_DATATYPE,
+    build_seq_record,
+    decode_page_payload,
+    encode_page_payload,
+    parse_seq_record,
+)
 
 
 # --- format constants (mirror c/decoder & c/encoder) -----------------------
@@ -30,6 +39,7 @@ LONG_BIT_PHASES = 2          # consecutive long crossings to emit one 1 bit
 SHORT_BIT_PHASES = 2         # consecutive short crossings to emit one 0 bit
 
 PATCH_DATA_LENGTH = 286      # bits per patch record (26 bytes * 11-bit frame)
+SEQ_DATA_LENGTH = 1463       # bits per sequence record (133 bytes * 11-bit frame)
 INTERTONE_RUN = 11           # >this many consecutive 1-bits resets to searching
 
 # encoder: pre-recorded one-cycle waveforms, sampled from a real JX-3P at 44.1kHz
@@ -353,3 +363,128 @@ def _render_patch(payload: bytes) -> np.ndarray:
 def _render_run_of_ones(n: int) -> np.ndarray:
     """Render ``n`` consecutive 1-bits as a single sample stream (pilot/separator)."""
     return np.tile(_AUDIO_BIT_ONE, n)
+
+
+# --- sequence WAV codec ----------------------------------------------------
+#
+# The JX-3P sequencer tape format reuses the patch tape's FSK audio carrier and
+# 11-bit serial framing, so the audio stages (_load_wav_mono_float,
+# _detect_crossings, _demodulate_bits) decode any tape dump regardless of
+# datatype. Sequence-specific differences live in the byte-layer decoding
+# below: 133-byte records (vs 26 for patches), datatype = 1 (not 2), and
+# 4-byte headers / per-step voice arrays defined in jx3p.sequence.
+
+def read_seq_wav(path: str | Path) -> JX3PSequence:
+    """Decode a JX-3P sequencer tape-dump WAV into a :class:`JX3PSequence`."""
+    samples = _load_wav_mono_float(Path(path))
+    crossings = _detect_crossings(samples)
+    bits = _demodulate_bits(crossings)
+    raw_pages = _decode_sequence_records(bits)
+
+    seq = JX3PSequence()
+    for page_idx, raw in raw_pages.items():
+        _idx, payload = parse_seq_record(raw)
+        seq.pages[page_idx] = decode_page_payload(payload)
+    return seq
+
+
+def write_seq_wav(path: str | Path, seq: JX3PSequence) -> None:
+    """Encode a :class:`JX3PSequence` as a JX-3P sequencer tape-dump WAV.
+
+    Mirrors :func:`write_wav` (patches): pilot tone, then for each page two
+    transmissions of the record separated by inter-record 1-bits.
+    """
+    if len(seq.pages) != PAGES_PER_SEQUENCE:
+        raise ValueError(
+            f"sequence must have {PAGES_PER_SEQUENCE} pages, got {len(seq.pages)}"
+        )
+
+    chunks: list[np.ndarray] = [_render_run_of_ones(_PILOT_BITS)]
+    for page_idx, page in enumerate(seq.pages):
+        payload = encode_page_payload(page)
+        record = build_seq_record(page_idx, payload)
+        chunks.append(_render_seq_record(record))
+        chunks.append(_render_run_of_ones(_SEPARATOR_BITS))
+        chunks.append(_render_seq_record(record))
+        chunks.append(_render_run_of_ones(_SEPARATOR_BITS))
+
+    audio = np.concatenate(chunks).astype(np.int16, copy=False)
+    with wave.open(str(path), "wb") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(WAVE_SAMPLE_RATE)
+        fh.writeframes(audio.tobytes())
+
+
+def _decode_sequence_records(bits: list[int]) -> dict[int, bytes]:
+    """Find sequence records in the bitstream and return ``{page_idx: raw133}``.
+
+    Parallels :func:`_decode_patches` but for 133-byte records. Each page is
+    transmitted twice; the first valid copy wins.
+    """
+    DS_SEARCHING = 0
+    DS_COLLECTING = 1
+
+    state = DS_COLLECTING
+    bucket: list[int] = []
+    one_count = 0
+    found: dict[int, bytes] = {}
+
+    for bit in bits:
+        if bit:
+            one_count += 1
+        else:
+            one_count = 0
+            if state == DS_SEARCHING:
+                state = DS_COLLECTING
+                bucket.clear()
+
+        if one_count > INTERTONE_RUN and state != DS_SEARCHING:
+            bucket.clear()
+            state = DS_SEARCHING
+            continue
+
+        if state == DS_COLLECTING:
+            bucket.append(bit)
+            if len(bucket) >= SEQ_DATA_LENGTH:
+                raw = _convert_seq_bucket_to_bytes(bucket)
+                if raw is not None and (raw[0] >> 6) & 0x3 == SEQUENCE_DATATYPE:
+                    page_idx = raw[2]
+                    if 0 <= page_idx < PAGES_PER_SEQUENCE and page_idx not in found:
+                        found[page_idx] = raw
+                bucket.clear()
+                state = DS_SEARCHING
+
+    return found
+
+
+def _convert_seq_bucket_to_bytes(bucket: list[int]) -> bytes | None:
+    """Pack 1463 bits (133 bytes × 11-bit serial frame, LSB first) into 133 bytes.
+
+    Returns ``None`` if the trailing checksum byte does not match the sum of
+    the preceding 132.
+    """
+    out = bytearray(133)
+    for byte_idx in range(133):
+        b = 0
+        for bit_idx in range(8):
+            b |= (bucket[byte_idx * 11 + 1 + bit_idx] & 1) << bit_idx
+        out[byte_idx] = b
+    expected = sum(out[:132]) & 0xFF
+    if expected != out[132]:
+        return None
+    return bytes(out)
+
+
+def _render_seq_record(record: bytes) -> np.ndarray:
+    """Render a 133-byte sequence record as an int16 sample stream."""
+    if len(record) != 133:
+        raise ValueError(f"sequence record must be 133 bytes, got {len(record)}")
+    chunks: list[np.ndarray] = []
+    for byte in record:
+        chunks.append(_AUDIO_BIT_ZERO)  # start bit
+        for bit_idx in range(8):
+            chunks.append(_AUDIO_BIT_ONE if (byte >> bit_idx) & 1 else _AUDIO_BIT_ZERO)
+        chunks.append(_AUDIO_BIT_ONE)   # stop bit
+        chunks.append(_AUDIO_BIT_ONE)   # stop bit
+    return np.concatenate(chunks)

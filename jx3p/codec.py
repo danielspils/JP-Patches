@@ -38,6 +38,14 @@ SHORT_THRESHOLD = 0.625      # crossing < long_avg * SHORT_THRESHOLD => short cy
 LONG_BIT_PHASES = 2          # consecutive long crossings to emit one 1 bit
 SHORT_BIT_PHASES = 2         # consecutive short crossings to emit one 0 bit
 
+# Quiet-recording rescue. Tape dumps recorded with too little Mac/interface
+# input gain never reach QUIESCENCE_THRESHOLD, so the detector emits zero
+# crossings and the decoder finds no records (the user sees an empty JSON).
+# After loading a WAV we look at its peak amplitude: if it is below
+# AUTO_BOOST_TARGET we scale the samples up so the peak equals the target.
+# Loud-enough inputs (peak >= target) pass through untouched.
+AUTO_BOOST_TARGET = 0.7
+
 PATCH_DATA_LENGTH = 286      # bits per patch record (26 bytes * 11-bit frame)
 SEQ_DATA_LENGTH = 1463       # bits per sequence record (133 bytes * 11-bit frame)
 INTERTONE_RUN = 11           # >this many consecutive 1-bits resets to searching
@@ -144,7 +152,15 @@ def _load_wav_mono_float(path: Path) -> np.ndarray:
 
     if n_channels > 1:
         data = data.reshape(-1, n_channels)[:, 0]
-    return data.astype(np.float64) * scale
+    samples = data.astype(np.float64) * scale
+
+    # Quiet-recording rescue (see AUTO_BOOST_TARGET above). Only ever amplifies;
+    # never attenuates a healthy recording. Digital silence (peak == 0) is left
+    # alone to avoid division by zero.
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if 0.0 < peak < AUTO_BOOST_TARGET:
+        samples = samples * (AUTO_BOOST_TARGET / peak)
+    return samples
 
 
 # --- detector --------------------------------------------------------------

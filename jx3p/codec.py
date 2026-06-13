@@ -44,7 +44,15 @@ SHORT_BIT_PHASES = 2         # consecutive short crossings to emit one 0 bit
 # After loading a WAV we look at its peak amplitude: if it is below
 # AUTO_BOOST_TARGET we scale the samples up so the peak equals the target.
 # Loud-enough inputs (peak >= target) pass through untouched.
-AUTO_BOOST_TARGET = 0.7
+#
+# Target raised 0.7 -> 0.92 (2026-06-12). The app's Record-from-JX
+# calibration normalizes the capture PEAK to ~0.78, so the old 0.7 target
+# sat BELOW the calibration aim and never fired for a calibrated user.
+# That left the weak passages of a dump dipping toward the ±0.15 detector
+# band on quieter JX units, dropping crossings (sequences fail first).
+# 0.92 lifts every loaded WAV to a hot, crossing-reliable level at decode
+# time without the user having to over-drive (and clip) the capture.
+AUTO_BOOST_TARGET = 0.92
 
 PATCH_DATA_LENGTH = 286      # bits per patch record (26 bytes * 11-bit frame)
 SEQ_DATA_LENGTH = 1463       # bits per sequence record (133 bytes * 11-bit frame)
